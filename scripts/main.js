@@ -43,10 +43,23 @@ import {
   bulkEntryToIndividual, getLeaderboard,
 } from "./data.js";
 
-const K_PEND_GEM  = "gacha:pend_gem:";
-const K_PEND_COIN = "gacha:pend_coin:";
+// ═══════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════
+const K_PEND_GEM      = "gacha:pend_gem:";
+const K_PEND_COIN     = "gacha:pend_coin:";
 
-const K_REG_CHESTS = "gacha:reg_chests";
+// [FIX RESTART] Key untuk pessimistic refund — disimpan ke DP sebelum session
+// gacha dimulai, dihapus di finally setelah selesai normal. Jika server restart
+// di tengah pull, cost dikembalikan otomatis saat player login berikutnya.
+const K_SESS_REF      = "gacha:sess_ref:";
+
+// Key untuk menyimpan string import yang di-stage via scriptevent sebelum
+// dikonfirmasi lewat UI admin. Import tidak bisa dilakukan langsung dari UI
+// tanpa staging ini terlebih dahulu.
+const K_STAGED_IMPORT = "gacha:staged_import";
+
+const K_REG_CHESTS    = "gacha:reg_chests";
 
 function getAllowedChests() { return dpGet(K_REG_CHESTS, []); }
 function saveAllowedChests(list) { dpSet(K_REG_CHESTS, list); }
@@ -583,6 +596,12 @@ async function executeGachaIntent(player, intent, block) {
     : (type === "PARTICLE" ? CFG.PT_COST_1  : CFG.EQ_COST_1);
   const dim = player.dimension;
 
+  // [FIX RESTART] Pessimistic refund: simpan cost ke DP sebelum session aktif.
+  // Jika server restart di tengah pull, cost dikembalikan otomatis saat player login.
+  // Dihapus di finally setelah session selesai dengan aman.
+  const sessRefKey = K_SESS_REF + player.id;
+  dpSet(sessRefKey, { type, cost });
+
   sfx(player, SFX.PAY);
 
   const loc   = { ...chestBlock.location };
@@ -596,6 +615,7 @@ async function executeGachaIntent(player, intent, block) {
   };
 
   if (!fresh()) {
+    dpDel(sessRefKey);
     await withLock(player.id, async () => refund(type, player, cost));
     player.sendMessage(`§c[Gacha] ⚠ Chest hilang! §f${cost} ${unit} dikembalikan.`);
     lastPull.set(player.id, system.currentTick);
@@ -635,7 +655,11 @@ async function executeGachaIntent(player, intent, block) {
     if (isStillOnline) {
       await withLock(player.id, async () => refund(type, player, cost));
     } else {
+      // Player offline di tengah session: simpan refund ke pend key.
+      // sessRefKey sudah di-set di atas, tapi saat offline kita perlu
+      // menghapus sessRefKey dan set pend key agar tidak double refund saat login.
       try {
+        dpDel(sessRefKey);
         const pendKey  = type === "PARTICLE" ? (K_PEND_GEM + player.id) : (K_PEND_COIN + player.id);
         const existing = dpGet(pendKey, null);
         const refundVal = existing !== null ? existing + cost : balAfterDeduct + cost;
@@ -654,6 +678,9 @@ async function executeGachaIntent(player, intent, block) {
       player.sendMessage(`§c[Gacha] ⚠ Error! §f${cost} ${unit} dikembalikan.`);
     }
   } finally {
+    // [FIX RESTART] Hapus pessimistic refund — session selesai normal atau sudah
+    // ditangani di catch (offline). Tidak ada double refund saat login berikutnya.
+    dpDel(sessRefKey);
     clearLock(key);
     try { const c = fresh(); if (c) clrBox(c); } catch {}
     lastPull.set(player.id, system.currentTick);
@@ -680,34 +707,6 @@ async function doGacha(player, container, key, type, is10x, baseCost) {
     pushPlayerHist(player, results, type);
     pushGlobalHist(player.name, results, type);
     broadcastRare(player.name, results, type);
-    const res = await showResultForm(player, results, is10x, type, baseCost);
-    if (res.canceled || res.selection !== 1) break;
-    if (type === "EQUIPMENT" && freeSlots(player) < 1) {
-      sfx(player, SFX.BROKE); player.sendMessage("§c⚠ Inventory penuh!"); break;
-    }
-    const ok = await withLock(player.id, async () => deduct(type, player, baseCost));
-    if (!ok) { sfx(player, SFX.BROKE); await showNoBal(player, baseCost, type); break; }
-    sfx(player, SFX.PAY);
-    for (let i = 0; i < 3; i++) { await wait(8); sfx(player, SFX.TICK, 1.5 - i * 0.3); }
-  }
-}
-
-async function doGachaNoChest(player, type, is10x, baseCost) {
-  const rollFn = type === "PARTICLE" ? rollPt : rollEq;
-  const statsK = type === "PARTICLE" ? CFG.K_PT_STATS : CFG.K_EQ_STATS;
-  sfx(player, SFX.READY);
-  for (let i = 0; i < 3; i++) { await wait(10); sfx(player, SFX.TICK, 1.5 - i * 0.3); }
-  while (true) {
-    const rawResults = is10x ? rollMany(rollFn, player, 10) : [rollFn(player)];
-    const results    = rawResults.map(r => applyReward(player, r, type));
-    recordStats(statsK, player, results);
-    pushPlayerHist(player, results, type);
-    pushGlobalHist(player.name, results, type);
-    broadcastRare(player.name, results, type);
-    const best = results.reduce((b, r) =>
-      R_KEYS.indexOf(r.rarity) > R_KEYS.indexOf(b.rarity) ? r : b, results[0]);
-    sfx(player, best.isDup ? SFX.DUP : SFX.REVEAL[best.rarity]);
-    if (best.rarity === "LEGENDARY" && !best.isDup) system.runTimeout(() => sfx(player, SFX.LEG2), 10);
     const res = await showResultForm(player, results, is10x, type, baseCost);
     if (res.canceled || res.selection !== 1) break;
     if (type === "EQUIPMENT" && freeSlots(player) < 1) {
@@ -902,13 +901,16 @@ async function showAdminMenu(player) {
     const reg        = getPlayerReg();
     const pendImps   = Object.keys(reg).filter(id => dpGet(CFG.K_IMPORT_PEND + id, null) !== null).length;
     const regChests  = getAllowedChests();
+    const hasStagedImport = dpGet(K_STAGED_IMPORT, null) !== null;
 
     const form = new ActionFormData().title("§l§c  ADMIN PANEL  §r")
       .body(
         `${HR}\n§c§lADMIN  §7| §fLogin: §a${player.name}  §7Online: §f${world.getPlayers().length}\n` +
         `§7Kode: §f${Object.keys(codes).length}  §7| §7Player: §f${Object.keys(reg).length}\n` +
         `§7Chest Terdaftar: §a${regChests.length}\n` +
-        (pendImps ? `§e⚠ Pending import: ${pendImps} player\n` : "") + HR
+        (pendImps ? `§e⚠ Pending import: ${pendImps} player\n` : "") +
+        (hasStagedImport ? `§b⚡ Data import siap dikonfirmasi!\n` : "") +
+        HR
       )
       .button("§l Kelola Gem Player")
       .button("§l Kelola Koin Player")
@@ -1263,22 +1265,42 @@ async function showExportImportAllUI(adminPlayer) {
       return Object.keys(reg).filter(id => dpGet(CFG.K_IMPORT_PEND + id, null) !== null).length;
     })();
 
+    const stagedImport    = dpGet(K_STAGED_IMPORT, null);
+    const hasStagedImport = stagedImport !== null;
+
     const form = new ActionFormData().title("§l§3  Export / Import  §r")
       .body(
         `${HR}\n§7Format: §fGSALL5  §7(hanya player dengan Gem atau Partikel)\n` +
-        (pendingCount ? `§e⚠ ${pendingCount} player menunggu pending import\n` : "") + HR
+        (pendingCount ? `§e⚠ ${pendingCount} player menunggu pending import\n` : "") +
+        (hasStagedImport
+          ? `§b⚡ Data import siap — §f${stagedImport.count ?? "?"} player · oleh §a${stagedImport.stagedBy ?? "?"}\n`
+          : `§7Belum ada data import yang disiapkan\n`) +
+        HR
       )
       .button("§l Export Data")
-      .button("§l Import Data")
+      .button(hasStagedImport ? "§l§c Import Data §e[SIAP ⚡]" : "§l Import Data")
       .button("§l Pending Import")
+      .button(hasStagedImport ? "§l§7 Hapus Data Staged" : "§8 Hapus Data Staged")
       .button("§l Kembali");
 
     sfx(adminPlayer, SFX.ADMIN);
     const res = await form.show(adminPlayer);
-    if (res.canceled || res.selection === 3) return;
+    if (res.canceled || res.selection === 4) return;
     if      (res.selection === 0) await showBulkExportUI(adminPlayer);
     else if (res.selection === 1) await showBulkImportUI(adminPlayer);
     else if (res.selection === 2) await showPendingImportList(adminPlayer);
+    else if (res.selection === 3) {
+      if (!hasStagedImport) { adminPlayer.sendMessage("§7Tidak ada data staged untuk dihapus."); continue; }
+      const confirm = await new MessageFormData()
+        .title("§l  Hapus Data Staged?  §r")
+        .body(`§f Hapus data import yang sedang disiapkan?\n§7Data ini tidak akan diterapkan.`)
+        .button1("§7 Batal").button2("§c Ya, Hapus").show(adminPlayer);
+      if (!confirm.canceled && confirm.selection === 1) {
+        dpDel(K_STAGED_IMPORT);
+        adminPlayer.sendMessage("§a[Admin] Data staged dihapus.");
+        sfx(adminPlayer, SFX.ADMIN);
+      }
+    }
   }
 }
 
@@ -1303,41 +1325,112 @@ async function showBulkExportUI(adminPlayer) {
     .show(adminPlayer);
 }
 
+// [FITUR BARU] Import membaca dari staged DP (di-set via gacha:prepare_import),
+// bukan lagi dari text field. Admin wajib staging dulu sebelum bisa konfirmasi.
 async function showBulkImportUI(adminPlayer) {
   if (!adminPlayer.hasTag(CFG.ADMIN_TAG)) { adminPlayer.sendMessage("§c[!] Akses ditolak."); return; }
 
-  const inputRes = await new ModalFormData().title("§l§6  Import Data  §r")
-    .textField(
-      `§fTempel string export (GSALL5|N|...):\n§c⚠ Data player dalam string akan DITIMPA!`,
-      "GSALL5|...", ""
-    ).show(adminPlayer);
-  if (inputRes.canceled) return;
+  const staged = dpGet(K_STAGED_IMPORT, null);
 
-  const raw = String(inputRes.formValues?.[0] ?? "").trim();
-  if (!raw) { adminPlayer.sendMessage("§c[!] String kosong."); return; }
+  // Belum ada data staged — tampilkan instruksi cara staging
+  if (!staged) {
+    await new ActionFormData()
+      .title("§l§6  Import Data  §r")
+      .body(
+        `${HR}\n§e⚠ Belum ada data import yang disiapkan.\n\n` +
+        `§fCara menyiapkan data import:\n\n` +
+        `§71. Lakukan Export terlebih dahulu\n` +
+        `§72. Copy seluruh string export (GSALL5|...)\n` +
+        `§73. Jalankan perintah berikut di chat atau console:\n\n` +
+        `§f/scriptevent gacha:prepare_import §bGSALL5|...\n\n` +
+        `§74. Kembali ke menu ini untuk konfirmasi\n\n` +
+        `§8Catatan: data tidak langsung diterapkan.\n` +
+        `§8Konfirmasi dilakukan dari UI ini.\n` +
+        `${HR}`
+      )
+      .button("§l Mengerti").show(adminPlayer);
+    return;
+  }
 
-  const parsed = parseBulkImport(raw);
-  if (!parsed.ok) { adminPlayer.sendMessage(`§c[!] Gagal baca string: ${parsed.err}`); return; }
+  // Validasi string staged
+  const parsed = parseBulkImport(staged.str ?? "");
+  if (!parsed.ok) {
+    await new ActionFormData()
+      .title("§l§c  Import Data — Data Tidak Valid  §r")
+      .body(
+        `${HR}\n§cData yang di-stage tidak valid:\n§f${parsed.err}\n\n` +
+        `§7Hapus data ini dan ulangi dengan:\n` +
+        `§f/scriptevent gacha:prepare_import §bGSALL5|...\n${HR}`
+      )
+      .button("§l Hapus & Kembali").show(adminPlayer);
+    dpDel(K_STAGED_IMPORT);
+    return;
+  }
 
   const { items } = parsed;
-  const confirm = await new MessageFormData().title("§l  Konfirmasi Import  §r")
-    .body(
-      `§f Terapkan data untuk §a${items.length} player§f?\n${HR}\n` +
-      `§c⚠ Data lama DITIMPA. Tidak bisa di-undo!\n` +
-      `§7Player offline diterapkan saat login berikutnya.`
-    )
-    .button1("§7 Batal").button2("§c Ya, Terapkan").show(adminPlayer);
-  if (confirm.canceled || confirm.selection !== 1) return;
+  const stagedBy  = staged.stagedBy ?? "tidak diketahui";
+  const stagedAt  = staged.stagedAt
+    ? new Date(staged.stagedAt).toLocaleString("id-ID", { hour12: false })
+    : "tidak diketahui";
 
-  adminPlayer.sendMessage("§e[Gacha] Menerapkan import...");
+  // Langkah 1: Tampilkan info + peringatan bahaya
+  const step1 = await new ActionFormData()
+    .title("§l§6  Konfirmasi Import — Periksa Data  §r")
+    .body(
+      `${HR}\n§e★ Data Import Tersedia:\n` +
+      `§f • Jumlah player  : §a${items.length}\n` +
+      `§f • Disiapkan oleh : §a${stagedBy}\n` +
+      `§f • Waktu staging  : §7${stagedAt}\n` +
+      `${HR}\n` +
+      `§4§l⚠⚠  PERINGATAN BAHAYA  ⚠⚠§r\n\n` +
+      `§cOperasi ini akan MENIMPA data permanen:\n\n` +
+      `§f  • §cGem §fsemua player dalam string\n` +
+      `§f  • §cKoleksi partikel §fsemua player\n` +
+      `§f  • §cPity counter §fequipment semua player\n\n` +
+      `§c§lData yang ditimpa TIDAK BISA dipulihkan!\n§r\n` +
+      `§e• Player online → langsung terpengaruh\n` +
+      `§e• Player offline → terpengaruh saat login\n\n` +
+      `§7Pastikan kamu sudah backup data sebelum lanjut.\n` +
+      `§7Gunakan fitur Export untuk backup terlebih dahulu.\n` +
+      `${HR}`
+    )
+    .button("§7 Batal, Kembali")
+    .button("§c Saya mengerti risikonya — Lanjut")
+    .show(adminPlayer);
+
+  if (step1.canceled || step1.selection !== 1) return;
+
+  // Langkah 2: Konfirmasi akhir — MessageFormData (2 tombol, tidak bisa dismiss)
+  const step2 = await new MessageFormData()
+    .title("§l§4  !! KONFIRMASI AKHIR !!  §r")
+    .body(
+      `§4§l⚠ TINDAKAN TIDAK BISA DI-UNDO! ⚠§r\n\n` +
+      `§fData §a${items.length} player §fakan ditimpa sekarang.\n\n` +
+      `§eApakah kamu benar-benar yakin ingin melanjutkan?`
+    )
+    .button1("§7  Tidak, Batalkan")
+    .button2("§4  Ya, Terapkan Sekarang")
+    .show(adminPlayer);
+
+  if (step2.canceled || step2.selection !== 1) {
+    adminPlayer.sendMessage("§7[Import] Dibatalkan.");
+    return;
+  }
+
+  // Terapkan import
+  adminPlayer.sendMessage("§e[Gacha] Menerapkan import, mohon tunggu...");
   const stats = applyBulkAll(items);
+  dpDel(K_STAGED_IMPORT);
   sfx(adminPlayer, SFX.ADMIN);
+
   const notFoundInfo = stats.notFoundNames.length
     ? `\n§c   (${stats.notFoundNames.slice(0, 5).join(", ")}${stats.notFoundNames.length > 5 ? "..." : ""})`
     : "";
   adminPlayer.sendMessage(
-    `§a[★] Import Selesai!\n§7 Online  (langsung): §a${stats.applied}\n` +
-    `§7 Offline (pending) : §e${stats.pending}\n§7 Tidak ditemukan   : §c${stats.notFound}${notFoundInfo}`
+    `§a[★] Import Selesai!\n` +
+    `§7 Online  (langsung) : §a${stats.applied}\n` +
+    `§7 Offline (pending)  : §e${stats.pending}\n` +
+    `§7 Tidak ditemukan    : §c${stats.notFound}${notFoundInfo}`
   );
 }
 
@@ -1380,7 +1473,7 @@ async function showPendingImportList(adminPlayer) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// ACTION BAR — tampil sekali saat pertama kali memegang amethyst
+// ACTION BAR
 // ═══════════════════════════════════════════════════════════
 const _triggerHolders = new Set();
 
@@ -1464,6 +1557,26 @@ world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
   system.runTimeout(() => {
     const live = world.getPlayers().find(p => p.id === player.id);
     if (!live) return;
+
+    // [FIX RESTART] Cek pessimistic refund — sisa sesi gacha yang terputus
+    // saat server restart. Cost dikembalikan otomatis sebelum cek pending lain.
+    const sessRef = dpGet(K_SESS_REF + live.id, null);
+    if (sessRef) {
+      try {
+        const refCost = sessRef.cost ?? 0;
+        const refType = sessRef.type ?? "PARTICLE";
+        if (refCost > 0) {
+          if (refType === "PARTICLE") setGem(live, getGem(live) + refCost);
+          else setScore(CFG.COIN_OBJ, live, getCoin(live) + refCost);
+          live.sendMessage(
+            `§a[+] ${refCost} ${refType === "PARTICLE" ? "Gem" : "Koin"} dikembalikan otomatis.\n` +
+            `§7(Sesi gacha terputus saat server restart)`
+          );
+          sfx(live, SFX.CLAIM);
+        }
+      } catch (e) { console.warn("[Gacha] sessRef recovery error:", e); }
+      dpDel(K_SESS_REF + live.id);
+    }
 
     const pendGem = dpGet(K_PEND_GEM + live.id, null);
     if (pendGem !== null) {
@@ -1582,6 +1695,7 @@ system.afterEvents.scriptEventReceive.subscribe(ev => {
   const src = ev.sourceEntity;
   const isAdmin = !src || (typeof src.hasTag === "function" && src.hasTag(CFG.ADMIN_TAG));
 
+  // ── gacha:bulk_export ──────────────────────────────────────
   if (ev.id === "gacha:bulk_export") {
     if (!isAdmin) { src?.sendMessage?.("§c[!] Akses ditolak. Butuh tag: " + CFG.ADMIN_TAG); return; }
     try {
@@ -1589,12 +1703,61 @@ system.afterEvents.scriptEventReceive.subscribe(ev => {
       logBulkToConsole(result);
       src?.sendMessage?.(
         `§a[GachaBulk] Export selesai!\n§7 Total player: §f${result.entries.length}\n` +
-        `§7 Panjang str : §f${result.full.length} char\n§eString lengkap sudah dicetak di console server.`
+        `§7 Panjang str : §f${result.full.length} char\n§eString sudah dicetak di console server.`
       );
     } catch (err) { console.error("[GachaBulk] export error:", err); }
     return;
   }
 
+  // ── gacha:prepare_import ───────────────────────────────────
+  // Menyimpan string import ke DP sebagai staged data.
+  // Admin harus konfirmasi lewat UI sebelum import diterapkan.
+  // Cara pakai: /scriptevent gacha:prepare_import GSALL5|N|...
+  if (ev.id === "gacha:prepare_import") {
+    if (!isAdmin) { src?.sendMessage?.("§c[!] Akses ditolak. Butuh tag: " + CFG.ADMIN_TAG); return; }
+    const raw = (ev.message ?? "").trim();
+    if (!raw) {
+      src?.sendMessage?.(
+        `§c[!] String kosong.\n` +
+        `§7Cara: §f/scriptevent gacha:prepare_import §bGSALL5|N|...`
+      );
+      return;
+    }
+    const parsed = parseBulkImport(raw);
+    if (!parsed.ok) {
+      src?.sendMessage?.(`§c[!] String tidak valid: §f${parsed.err}`);
+      return;
+    }
+    const senderName = (src && typeof src.name === "string") ? src.name : "Console";
+    dpSet(K_STAGED_IMPORT, {
+      str:      raw,
+      stagedBy: senderName,
+      stagedAt: Date.now(),
+      count:    parsed.items.length,
+    });
+    src?.sendMessage?.(
+      `§a[✔] Data import disiapkan!\n` +
+      `§7 Player   : §f${parsed.items.length}\n` +
+      `§7 Konfirmasi: §eAdmin Panel → Export/Import → Import Data`
+    );
+    return;
+  }
+
+  // ── gacha:clear_staged ─────────────────────────────────────
+  // Membatalkan/menghapus data staged yang belum dikonfirmasi.
+  // Cara pakai: /scriptevent gacha:clear_staged
+  if (ev.id === "gacha:clear_staged") {
+    if (!isAdmin) { src?.sendMessage?.("§c[!] Akses ditolak. Butuh tag: " + CFG.ADMIN_TAG); return; }
+    const existing = dpGet(K_STAGED_IMPORT, null);
+    if (!existing) { src?.sendMessage?.("§7Tidak ada data staged."); return; }
+    dpDel(K_STAGED_IMPORT);
+    src?.sendMessage?.("§a[✔] Data staged dihapus. Import dibatalkan.");
+    return;
+  }
+
+  // ── gacha:bulk_import ──────────────────────────────────────
+  // Import langsung tanpa konfirmasi UI (untuk penggunaan console/server admin).
+  // Untuk keamanan lebih, gunakan gacha:prepare_import + UI.
   if (ev.id === "gacha:bulk_import") {
     if (!isAdmin) { src?.sendMessage?.("§c[!] Akses ditolak. Butuh tag: " + CFG.ADMIN_TAG); return; }
     const raw = (ev.message ?? "").trim();
