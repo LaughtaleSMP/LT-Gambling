@@ -48,17 +48,8 @@ import {
 // ═══════════════════════════════════════════════════════════
 const K_PEND_GEM      = "gacha:pend_gem:";
 const K_PEND_COIN     = "gacha:pend_coin:";
-
-// [FIX RESTART] Key untuk pessimistic refund — disimpan ke DP sebelum session
-// gacha dimulai, dihapus di finally setelah selesai normal. Jika server restart
-// di tengah pull, cost dikembalikan otomatis saat player login berikutnya.
 const K_SESS_REF      = "gacha:sess_ref:";
-
-// Key untuk menyimpan string import yang di-stage via scriptevent sebelum
-// dikonfirmasi lewat UI admin. Import tidak bisa dilakukan langsung dari UI
-// tanpa staging ini terlebih dahulu.
 const K_STAGED_IMPORT = "gacha:staged_import";
-
 const K_REG_CHESTS    = "gacha:reg_chests";
 
 function getAllowedChests() { return dpGet(K_REG_CHESTS, []); }
@@ -136,7 +127,9 @@ function nearbyValidChestCached(player) {
 const IDLE_BORDER    = [0,1,2,3,4,5,6,7,8, 17, 26,25,24,23,22,21,20,19,18, 9];
 const IDLE_INNER     = [10,11,12,14,15,16];
 const IDLE_CENTER    = 13;
-const IDLE_ANIM_INT  = 3;
+// [OPT] Dinaikkan dari 3 → 5 tick: animasi comet masih halus (~100ms),
+// hemat ~40% operasi ItemStack create + container.setItem per chest.
+const IDLE_ANIM_INT  = 5;
 const IDLE_COMET_LEN = 5;
 
 function startIdleForChest(key, dimId, loc, type) {
@@ -227,7 +220,10 @@ function drawIdleFrame(container, key, type, frame) {
   const lbl = (isPt ? ptL : eqL)[Math.floor(frame / 25) % 3];
   setSlot(container, key, IDLE_CENTER, icon, lbl);
 
-  snapshotExpected(key);
+  // [OPT] dpSet hanya tiap 25 frame (bukan setiap frame).
+  // Snapshot tidak perlu update lebih sering dari itu karena hanya dipakai
+  // oleh global guard untuk restore saat chest idle tanpa sesi aktif.
+  if (frame === 0 || frame % 25 === 0) snapshotExpected(key);
 }
 
 function drawIdle(container, key, type) {
@@ -308,6 +304,8 @@ async function reveal10x(container, results, key, player, type) {
 }
 
 function startGuard(container, key, ownerId) {
+  // [OPT] Interval dinaikkan 2 → 4 tick: masih cukup cepat mencegah theft,
+  // hemat 50% chest slot read selama sesi aktif.
   const guardId = system.runInterval(() => {
     const stillActive = activeChests.has(key) || isSessionOwner(key, ownerId);
     if (!stillActive) { chestExpected.delete(key); system.clearRun(guardId); return; }
@@ -320,18 +318,10 @@ function startGuard(container, key, ownerId) {
           container.setItem(slot, mkItem(e.typeId, e.nameTag.replace(MARK, "")));
       }
     } catch {}
-    try {
-      for (const p of world.getPlayers()) {
-        const inv = p.getComponent("minecraft:inventory")?.container; if (!inv) continue;
-        for (let s = 0; s < inv.size; s++) {
-          if (isMark(inv.getItem(s))) {
-            inv.setItem(s, undefined);
-            p.sendMessage("§c⚠ Item gacha tidak bisa diambil!");
-          }
-        }
-      }
-    } catch {}
-  }, 2);
+    // [OPT] Inventory scan DIHAPUS dari sini — sudah ditangani oleh
+    // initSecurity (security.js) setiap 10 tick secara global.
+    // Melakukan scan di sini (2 tick) sekaligus di sana (10 tick) = redundan.
+  }, 4);
   return guardId;
 }
 
@@ -596,9 +586,6 @@ async function executeGachaIntent(player, intent, block) {
     : (type === "PARTICLE" ? CFG.PT_COST_1  : CFG.EQ_COST_1);
   const dim = player.dimension;
 
-  // [FIX RESTART] Pessimistic refund: simpan cost ke DP sebelum session aktif.
-  // Jika server restart di tengah pull, cost dikembalikan otomatis saat player login.
-  // Dihapus di finally setelah session selesai dengan aman.
   const sessRefKey = K_SESS_REF + player.id;
   dpSet(sessRefKey, { type, cost });
 
@@ -655,9 +642,6 @@ async function executeGachaIntent(player, intent, block) {
     if (isStillOnline) {
       await withLock(player.id, async () => refund(type, player, cost));
     } else {
-      // Player offline di tengah session: simpan refund ke pend key.
-      // sessRefKey sudah di-set di atas, tapi saat offline kita perlu
-      // menghapus sessRefKey dan set pend key agar tidak double refund saat login.
       try {
         dpDel(sessRefKey);
         const pendKey  = type === "PARTICLE" ? (K_PEND_GEM + player.id) : (K_PEND_COIN + player.id);
@@ -678,8 +662,6 @@ async function executeGachaIntent(player, intent, block) {
       player.sendMessage(`§c[Gacha] ⚠ Error! §f${cost} ${unit} dikembalikan.`);
     }
   } finally {
-    // [FIX RESTART] Hapus pessimistic refund — session selesai normal atau sudah
-    // ditangani di catch (offline). Tidak ada double refund saat login berikutnya.
     dpDel(sessRefKey);
     clearLock(key);
     try { const c = fresh(); if (c) clrBox(c); } catch {}
@@ -1325,14 +1307,11 @@ async function showBulkExportUI(adminPlayer) {
     .show(adminPlayer);
 }
 
-// [FITUR BARU] Import membaca dari staged DP (di-set via gacha:prepare_import),
-// bukan lagi dari text field. Admin wajib staging dulu sebelum bisa konfirmasi.
 async function showBulkImportUI(adminPlayer) {
   if (!adminPlayer.hasTag(CFG.ADMIN_TAG)) { adminPlayer.sendMessage("§c[!] Akses ditolak."); return; }
 
   const staged = dpGet(K_STAGED_IMPORT, null);
 
-  // Belum ada data staged — tampilkan instruksi cara staging
   if (!staged) {
     await new ActionFormData()
       .title("§l§6  Import Data  §r")
@@ -1352,7 +1331,6 @@ async function showBulkImportUI(adminPlayer) {
     return;
   }
 
-  // Validasi string staged
   const parsed = parseBulkImport(staged.str ?? "");
   if (!parsed.ok) {
     await new ActionFormData()
@@ -1373,7 +1351,6 @@ async function showBulkImportUI(adminPlayer) {
     ? new Date(staged.stagedAt).toLocaleString("id-ID", { hour12: false })
     : "tidak diketahui";
 
-  // Langkah 1: Tampilkan info + peringatan bahaya
   const step1 = await new ActionFormData()
     .title("§l§6  Konfirmasi Import — Periksa Data  §r")
     .body(
@@ -1400,7 +1377,6 @@ async function showBulkImportUI(adminPlayer) {
 
   if (step1.canceled || step1.selection !== 1) return;
 
-  // Langkah 2: Konfirmasi akhir — MessageFormData (2 tombol, tidak bisa dismiss)
   const step2 = await new MessageFormData()
     .title("§l§4  !! KONFIRMASI AKHIR !!  §r")
     .body(
@@ -1417,7 +1393,6 @@ async function showBulkImportUI(adminPlayer) {
     return;
   }
 
-  // Terapkan import
   adminPlayer.sendMessage("§e[Gacha] Menerapkan import, mohon tunggu...");
   const stats = applyBulkAll(items);
   dpDel(K_STAGED_IMPORT);
@@ -1558,8 +1533,6 @@ world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
     const live = world.getPlayers().find(p => p.id === player.id);
     if (!live) return;
 
-    // [FIX RESTART] Cek pessimistic refund — sisa sesi gacha yang terputus
-    // saat server restart. Cost dikembalikan otomatis sebelum cek pending lain.
     const sessRef = dpGet(K_SESS_REF + live.id, null);
     if (sessRef) {
       try {
@@ -1673,6 +1646,27 @@ world.afterEvents.itemUse.subscribe(ev => {
   });
 });
 
+world.beforeEvents.itemUseOn.subscribe(ev => {
+  const player = ev.source;
+  if (ev.itemStack?.typeId !== CFG.TRIGGER) return;
+  if (ev.block?.typeId === "minecraft:chest") return;
+  if (activePlayers.has(player.id) || pendingChestInteract.has(player.id)) return;
+  if ((lastPull.get(player.id) ?? 0) + CFG.PULL_CD > system.currentTick) {
+    system.run(() => player.sendMessage("§e[Gacha] Tunggu sebentar!"));
+    return;
+  }
+  ev.cancel = true;
+  system.run(async () => {
+    activePlayers.set(player.id, "__hub__");
+    try {
+      const claimed = claimPend(player);
+      if (claimed > 0) { sfx(player, SFX.CLAIM); player.sendMessage(`§a[+] ${claimed} item diklaim otomatis.`); }
+      await showHubMenu(player);
+    } catch (err) { console.error("[Gacha] Hub error:", err); }
+    finally { activePlayers.delete(player.id); }
+  });
+});
+
 registerSecureChestHandler(
   getChestType,
   isChestCandidate,
@@ -1695,7 +1689,6 @@ system.afterEvents.scriptEventReceive.subscribe(ev => {
   const src = ev.sourceEntity;
   const isAdmin = !src || (typeof src.hasTag === "function" && src.hasTag(CFG.ADMIN_TAG));
 
-  // ── gacha:bulk_export ──────────────────────────────────────
   if (ev.id === "gacha:bulk_export") {
     if (!isAdmin) { src?.sendMessage?.("§c[!] Akses ditolak. Butuh tag: " + CFG.ADMIN_TAG); return; }
     try {
@@ -1709,10 +1702,6 @@ system.afterEvents.scriptEventReceive.subscribe(ev => {
     return;
   }
 
-  // ── gacha:prepare_import ───────────────────────────────────
-  // Menyimpan string import ke DP sebagai staged data.
-  // Admin harus konfirmasi lewat UI sebelum import diterapkan.
-  // Cara pakai: /scriptevent gacha:prepare_import GSALL5|N|...
   if (ev.id === "gacha:prepare_import") {
     if (!isAdmin) { src?.sendMessage?.("§c[!] Akses ditolak. Butuh tag: " + CFG.ADMIN_TAG); return; }
     const raw = (ev.message ?? "").trim();
@@ -1743,9 +1732,6 @@ system.afterEvents.scriptEventReceive.subscribe(ev => {
     return;
   }
 
-  // ── gacha:clear_staged ─────────────────────────────────────
-  // Membatalkan/menghapus data staged yang belum dikonfirmasi.
-  // Cara pakai: /scriptevent gacha:clear_staged
   if (ev.id === "gacha:clear_staged") {
     if (!isAdmin) { src?.sendMessage?.("§c[!] Akses ditolak. Butuh tag: " + CFG.ADMIN_TAG); return; }
     const existing = dpGet(K_STAGED_IMPORT, null);
@@ -1755,9 +1741,6 @@ system.afterEvents.scriptEventReceive.subscribe(ev => {
     return;
   }
 
-  // ── gacha:bulk_import ──────────────────────────────────────
-  // Import langsung tanpa konfirmasi UI (untuk penggunaan console/server admin).
-  // Untuk keamanan lebih, gunakan gacha:prepare_import + UI.
   if (ev.id === "gacha:bulk_import") {
     if (!isAdmin) { src?.sendMessage?.("§c[!] Akses ditolak. Butuh tag: " + CFG.ADMIN_TAG); return; }
     const raw = (ev.message ?? "").trim();
